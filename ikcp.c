@@ -1,4 +1,4 @@
-//=====================================================================
+﻿//=====================================================================
 //
 // KCP - A Better ARQ Protocol Implementation
 // skywind3000 (at) gmail.com, 2010-2011
@@ -738,6 +738,13 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 
 //---------------------------------------------------------------------
 // input data
+//input函数接收udp协议传过来的报文，把udp报文解码成kcp报文进行缓存。
+//kcp报文分为ack报文，数据报文，探测窗口报文，响应窗口报文四种。
+//kcp报文的una字段表示对端希望接收的下一个kcp包序号,也就是说明接收端已经收到了所有小于una序号的kcp包。
+//解析una字段后需要把发送缓冲区里面包序号小于una的包全部丢弃掉。
+// ack报文则包含了对端收到的kcp包的序号，接到ack包后需要删除发送缓冲区中与ack包中的发送包序号（sn）相同的kcp包。
+//上述una和ack处理完后，需要更新kcp.snd_una(发送端第一个未被确认的包)，
+//如果snd_una增加了那么就说明对端正常收到且回应了发送方发送缓冲区第一个待确认的包，此时需要更新cwnd（拥塞窗口）
 //---------------------------------------------------------------------
 int ikcp_input(ikcpcb *kcp, const char *data, long size)
 {
@@ -762,13 +769,13 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 		data = ikcp_decode32u(data, &conv);
 		if (conv != kcp->conv) return -1;
 
-		data = ikcp_decode8u(data, &cmd);
-		data = ikcp_decode8u(data, &frg);
-		data = ikcp_decode16u(data, &wnd);
-		data = ikcp_decode32u(data, &ts);
-		data = ikcp_decode32u(data, &sn);
-		data = ikcp_decode32u(data, &una);
-		data = ikcp_decode32u(data, &len);
+		data = ikcp_decode8u(data, &cmd);//cmd，用来获取区分分片的作用
+		data = ikcp_decode8u(data, &frg);//用户数据可能会被分成多个KCP包发送，frag标识segment分片ID（在message中的索引，由大到小，0表示最后一个分片）
+		data = ikcp_decode16u(data, &wnd);//剩余接收窗口大小（接收窗口大小-接收队列大小），发送方的发送窗口不能超过接收方给出的数值
+		data = ikcp_decode32u(data, &ts);//发送数据时刻的时间戳
+		data = ikcp_decode32u(data, &sn);//message分片segment的序号，按1累次递增。
+		data = ikcp_decode32u(data, &una);//待接收消息序号(接收滑动窗口左端)。对于未丢包的网络来说，una是下一个可接收的序号，如收到sn=10的包，una为11
+		data = ikcp_decode32u(data, &len);//数据长度
 
 		size -= IKCP_OVERHEAD;
 
@@ -779,13 +786,17 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 			return -3;
 
 		kcp->rmt_wnd = wnd;
+		//根据una删除snd_buf中的消息，即从队列中删除收到的消息队列
 		ikcp_parse_una(kcp, una);
+		//更新最新的kcp snd_una
 		ikcp_shrink_buf(kcp);
 
-		if (cmd == IKCP_CMD_ACK) {
+		if (cmd == IKCP_CMD_ACK) {//ack报文
 			if (_itimediff(kcp->current, ts) >= 0) {
+				//根据两端的消息时间戳，我们来更新rrt,rto等信息
 				ikcp_update_ack(kcp, _itimediff(kcp->current, ts));
 			}
+			//根据ack中的sn来删除缓存队列
 			ikcp_parse_ack(kcp, sn);
 			ikcp_shrink_buf(kcp);
 			if (flag == 0) {
@@ -803,7 +814,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 					(long)kcp->rx_rto);
 			}
 		}
-		else if (cmd == IKCP_CMD_PUSH) {
+		else if (cmd == IKCP_CMD_PUSH) {//数据报文
 			if (ikcp_canlog(kcp, IKCP_LOG_IN_DATA)) {
 				ikcp_log(kcp, IKCP_LOG_IN_DATA, 
 					"input psh: sn=%lu ts=%lu", sn, ts);
@@ -829,7 +840,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 				}
 			}
 		}
-		else if (cmd == IKCP_CMD_WASK) {
+		else if (cmd == IKCP_CMD_WASK) {//探测窗口报文
 			// ready to send back IKCP_CMD_WINS in ikcp_flush
 			// tell remote my window size
 			kcp->probe |= IKCP_ASK_TELL;
@@ -837,7 +848,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 				ikcp_log(kcp, IKCP_LOG_IN_PROBE, "input probe");
 			}
 		}
-		else if (cmd == IKCP_CMD_WINS) {
+		else if (cmd == IKCP_CMD_WINS) {//响应窗口报文
 			// do nothing
 			if (ikcp_canlog(kcp, IKCP_LOG_IN_WINS)) {
 				ikcp_log(kcp, IKCP_LOG_IN_WINS,
@@ -852,14 +863,14 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 		size -= len;
 	}
 
-	if (flag != 0) {
+	if (flag != 0) {//
 		ikcp_parse_fastack(kcp, maxack);
 	}
 
 	if (_itimediff(kcp->snd_una, una) > 0) {
-		if (kcp->cwnd < kcp->rmt_wnd) {
+		if (kcp->cwnd < kcp->rmt_wnd) {//拥塞窗口大小<远端窗口大小
 			IUINT32 mss = kcp->mss;
-			if (kcp->cwnd < kcp->ssthresh) {
+			if (kcp->cwnd < kcp->ssthresh) {//拥塞窗口阈值，以包为单位
 				kcp->cwnd++;
 				kcp->incr += mss;
 			}	else {
