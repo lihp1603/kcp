@@ -594,6 +594,7 @@ static void ikcp_parse_una(ikcpcb *kcp, IUINT32 una)
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = next) {
 		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node);
 		next = p->next;
+		//如果收到的una>snd_buf中的sn,就将它从snd_buf中删除掉
 		if (_itimediff(una, seg->sn) > 0) {
 			iqueue_del(p);
 			ikcp_segment_delete(kcp, seg);
@@ -684,7 +685,7 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 		ikcp_segment_delete(kcp, newseg);
 		return;
 	}
-
+	//对于受到的数据，我们第一步是将它放到rcv_buf中进行排序
 	for (p = kcp->rcv_buf.prev; p != &kcp->rcv_buf; p = prev) {
 		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node);
 		prev = p->prev;
@@ -710,6 +711,8 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 	printf("rcv_nxt=%lu\n", kcp->rcv_nxt);
 #endif
 
+	//对于rcv_buf中排好序的数据，我们进行移动到rcv_queue队列中，等会recv函数就可以直接从队列中取走
+	//同时更新rcv_nxt大小
 	// move available data from rcv_buf -> rcv_queue
 	while (! iqueue_is_empty(&kcp->rcv_buf)) {
 		IKCPSEG *seg = iqueue_entry(kcp->rcv_buf.next, IKCPSEG, node);
@@ -774,7 +777,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 		data = ikcp_decode16u(data, &wnd);//剩余接收窗口大小（接收窗口大小-接收队列大小），发送方的发送窗口不能超过接收方给出的数值
 		data = ikcp_decode32u(data, &ts);//发送数据时刻的时间戳
 		data = ikcp_decode32u(data, &sn);//message分片segment的序号，按1累次递增。
-		data = ikcp_decode32u(data, &una);//待接收消息序号(接收滑动窗口左端)。对于未丢包的网络来说，una是下一个可接收的序号，如收到sn=10的包，una为11
+		data = ikcp_decode32u(data, &una);//接收方在发送应答的时候，我们告诉对方，我们已经收到了rcv_nxt之前的数据，所以为待接收消息序号(接收滑动窗口左端);对于发送端，表示我们缓存的窗口数据最左侧的数据包,即缓存的最小数据包序号
 		data = ikcp_decode32u(data, &len);//数据长度
 
 		size -= IKCP_OVERHEAD;
@@ -785,10 +788,10 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 			cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS) 
 			return -3;
 
-		kcp->rmt_wnd = wnd;
-		//根据una删除snd_buf中的消息，即从队列中删除收到的消息队列
-		ikcp_parse_una(kcp, una);
-		//更新最新的kcp snd_una
+		kcp->rmt_wnd = wnd;//记录下对端的窗口大小
+		//根据una删除snd_buf中的消息，即从队列中删除对方收到的消息
+		ikcp_parse_una(kcp, una);//
+		//更新最新的kcp snd_una，即更新我们目前缓存中最小的缓存序号包为snd_una,snd_una之前的数据包，我们已经全部删除
 		ikcp_shrink_buf(kcp);
 
 		if (cmd == IKCP_CMD_ACK) {//ack报文
@@ -796,9 +799,10 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 				//根据两端的消息时间戳，我们来更新rrt,rto等信息
 				ikcp_update_ack(kcp, _itimediff(kcp->current, ts));
 			}
-			//根据ack中的sn来删除缓存队列
+			//根据ack中的sn来删除缓存队列对方确认收到的数据
 			ikcp_parse_ack(kcp, sn);
-			ikcp_shrink_buf(kcp);
+			ikcp_shrink_buf(kcp);//更新最新的kcp snd_una
+			//计算这次数据中最大的ack sn序号
 			if (flag == 0) {
 				flag = 1;
 				maxack = sn;
@@ -820,7 +824,9 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 					"input psh: sn=%lu ts=%lu", sn, ts);
 			}
 			if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) < 0) {
+				//将收到数据的sn,ts记录下来，放到acklist，等会一并发送应答
 				ikcp_ack_push(kcp, sn, ts);
+				//因为对于数据接收方,rcv_nxt表示我们接下来待接收的数据序号，所以只有需要>rcv_nxt的数据才能被接收，否则可以直接丢弃
 				if (_itimediff(sn, kcp->rcv_nxt) >= 0) {
 					seg = ikcp_segment_new(kcp, len);
 					seg->conv = conv;
@@ -835,7 +841,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 					if (len > 0) {
 						memcpy(seg->data, data, len);
 					}
-
+					//将数据按序放入rcv_buf中
 					ikcp_parse_data(kcp, seg);
 				}
 			}
@@ -866,9 +872,9 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 	if (flag != 0) {//
 		ikcp_parse_fastack(kcp, maxack);
 	}
-
-	if (_itimediff(kcp->snd_una, una) > 0) {
-		if (kcp->cwnd < kcp->rmt_wnd) {//拥塞窗口大小<远端窗口大小
+	//网络比较好的时候，调整拥塞窗口大小的算法
+	if (_itimediff(kcp->snd_una, una) > 0) {//如果我们发送数据缓存中最左侧的数据包序号>接收端确认的最左侧数据包序号
+		if (kcp->cwnd < kcp->rmt_wnd) {//拥塞窗口大小<对端窗口大小
 			IUINT32 mss = kcp->mss;
 			if (kcp->cwnd < kcp->ssthresh) {//拥塞窗口阈值，以包为单位
 				kcp->cwnd++;
@@ -939,19 +945,20 @@ void ikcp_flush(ikcpcb *kcp)
 	seg.cmd = IKCP_CMD_ACK;
 	seg.frg = 0;
 	seg.wnd = ikcp_wnd_unused(kcp);
-	seg.una = kcp->rcv_nxt;
+	seg.una = kcp->rcv_nxt;//接收方在发送应答的时候，我们告诉对方，我们已经收到了rcv_nxt之前的数据
 	seg.len = 0;
 	seg.sn = 0;
 	seg.ts = 0;
 
 	// flush acknowledges
 	count = kcp->ackcount;
-	for (i = 0; i < count; i++) {
+	for (i = 0; i < count; i++) {//如果是接收方的话,收到数据之后，就先发送ack告知发送方
 		size = (int)(ptr - buffer);
 		if (size + (int)IKCP_OVERHEAD > (int)kcp->mtu) {
 			ikcp_output(kcp, buffer, size);
 			ptr = buffer;
 		}
+		//从acklist中获取消息的sn和ts
 		ikcp_ack_get(kcp, i, &seg.sn, &seg.ts);
 		ptr = ikcp_encode_seg(ptr, &seg);
 	}
@@ -1005,9 +1012,10 @@ void ikcp_flush(ikcpcb *kcp)
 	kcp->probe = 0;
 
 	// calculate window size
-	cwnd = _imin_(kcp->snd_wnd, kcp->rmt_wnd);
+	cwnd = _imin_(kcp->snd_wnd, kcp->rmt_wnd);//取发送窗口大小和对端接收窗口的最小值
 	if (kcp->nocwnd == 0) cwnd = _imin_(kcp->cwnd, cwnd);
 
+	//根据窗口大小，将snd_queue的数据移动到snd_buf中来
 	// move data from snd_queue to snd_buf
 	while (_itimediff(kcp->snd_nxt, kcp->snd_una + cwnd) < 0) {
 		IKCPSEG *newseg;
@@ -1025,7 +1033,7 @@ void ikcp_flush(ikcpcb *kcp)
 		newseg->wnd = seg.wnd;
 		newseg->ts = current;
 		newseg->sn = kcp->snd_nxt++;
-		newseg->una = kcp->rcv_nxt;
+		newseg->una = kcp->rcv_nxt;//
 		newseg->resendts = current;
 		newseg->rto = kcp->rx_rto;
 		newseg->fastack = 0;
@@ -1033,9 +1041,10 @@ void ikcp_flush(ikcpcb *kcp)
 	}
 
 	// calculate resent
-	resent = (kcp->fastresend > 0)? (IUINT32)kcp->fastresend : 0xffffffff;
+	resent = (kcp->fastresend > 0)? (IUINT32)kcp->fastresend : 0xffffffff;//计算触发快速重传的ack个数
 	rtomin = (kcp->nodelay == 0)? (kcp->rx_rto >> 3) : 0;
 
+	//发送snd_buf中的数据包
 	// flush data segments
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = p->next) {
 		IKCPSEG *segment = iqueue_entry(p, IKCPSEG, node);
@@ -1044,21 +1053,21 @@ void ikcp_flush(ikcpcb *kcp)
 			needsend = 1;
 			segment->xmit++;
 			segment->rto = kcp->rx_rto;
-			segment->resendts = current + segment->rto + rtomin;
+			segment->resendts = current + segment->rto + rtomin;//计算超时重传时间
 		}
-		else if (_itimediff(current, segment->resendts) >= 0) {
+		else if (_itimediff(current, segment->resendts) >= 0) {//触发超时重传
 			needsend = 1;
 			segment->xmit++;
 			kcp->xmit++;
 			if (kcp->nodelay == 0) {
-				segment->rto += kcp->rx_rto;
+				segment->rto += kcp->rx_rto;//
 			}	else {
-				segment->rto += kcp->rx_rto / 2;
+				segment->rto += kcp->rx_rto / 2;//正常情况下为1.5
 			}
 			segment->resendts = current + segment->rto;
 			lost = 1;
 		}
-		else if (segment->fastack >= resent) {
+		else if (segment->fastack >= resent) {//从ack知道被跳过了多少次，来确定这个消息是否需要重传
 			needsend = 1;
 			segment->xmit++;
 			segment->fastack = 0;
@@ -1087,7 +1096,7 @@ void ikcp_flush(ikcpcb *kcp)
 				ptr += segment->len;
 			}
 
-			if (segment->xmit >= kcp->dead_link) {
+			if (segment->xmit >= kcp->dead_link) {//如果重传次数到达最大的次数瓶颈，就认为网络连接中断，将状态设置为-1
 				kcp->state = -1;
 			}
 		}
@@ -1099,17 +1108,19 @@ void ikcp_flush(ikcpcb *kcp)
 		ikcp_output(kcp, buffer, size);
 	}
 
+	//重新计算拥塞窗口的大小，网络情况不好的时候
 	// update ssthresh
-	if (change) {
-		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una;
-		kcp->ssthresh = inflight / 2;
+	if (change) {//如果是因为ack被跳过一定次数认为的丢包的情况
+		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una;//计算有多个消息数量在网络传输中
+		kcp->ssthresh = inflight / 2;//拥塞窗口大小阀值计算
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
 			kcp->ssthresh = IKCP_THRESH_MIN;
 		kcp->cwnd = kcp->ssthresh + resent;
 		kcp->incr = kcp->cwnd * kcp->mss;
 	}
 
-	if (lost) {
+	//超时丢包的情况，说明网络情况更加糟糕，需要进一步对拥塞窗口进行计算
+	if (lost) {//数据发送超时，认为丢包的情况
 		kcp->ssthresh = cwnd / 2;
 		if (kcp->ssthresh < IKCP_THRESH_MIN)
 			kcp->ssthresh = IKCP_THRESH_MIN;

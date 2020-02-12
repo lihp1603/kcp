@@ -257,17 +257,17 @@ struct IKCPSEG
 {
 	struct IQUEUEHEAD node;
 	IUINT32 conv;
-	IUINT32 cmd;
-	IUINT32 frg;
-	IUINT32 wnd;
-	IUINT32 ts;
-	IUINT32 sn;
-	IUINT32 una;
+	IUINT32 cmd;//cmd，用来获取区分分片的作用
+	IUINT32 frg;//用户数据可能会被分成多个KCP包发送，frag标识segment分片ID（在message中的索引，由大到小，0表示最后一个分片）
+	IUINT32 wnd;//剩余接收窗口大小（接收窗口大小-接收队列大小），发送方的发送窗口不能超过接收方给出的数值
+	IUINT32 ts;//发送数据时刻的时间戳
+	IUINT32 sn;//message分片segment的序号，按1累次递增
+	IUINT32 una;//接收方在发送应答的时候，我们告诉对方，我们已经收到了rcv_nxt之前的数据，所以为待接收消息序号(接收滑动窗口左端);对于发送端，表示我们缓存的窗口数据最左侧的数据包,即缓存的最小数据包序号
 	IUINT32 len;
-	IUINT32 resendts;
+	IUINT32 resendts;//下次超时重传的时间戳
 	IUINT32 rto;
-	IUINT32 fastack;
-	IUINT32 xmit;
+	IUINT32 fastack;//收到ack时计算的该分片被跳过的累计次数，此字段用于快速重传，自定义需要几次确认开始快速重传
+	IUINT32 xmit;//发送分片的次数，每发送一次加一。发送的次数对RTO的计算有影响，但是比TCP来说，影响会小一些，计算思想类似
 	char data[1];
 };
 
@@ -278,7 +278,7 @@ struct IKCPSEG
 struct IKCPCB
 {
 	IUINT32 conv, mtu, mss, state;//conv:标识这个会话; mtu:最大传输单元,默认1400，最小50; mss:最大分片大小;state:链接状态（0xFFFFFFFF表示断开连接）
-	IUINT32 snd_una, snd_nxt, rcv_nxt;//snd_una:第一个未确认的包;snd_nxt:下一个待分配的包序号;rcv_nxt：待接收消息序号。为了保证包的顺序，接收方会维护一个接收窗口，接收窗口有一个起始序号rcv_nxt（待接收消息序号）以及尾序号 rcv_nxt + rcv_wnd（接收窗口大小）；
+	IUINT32 snd_una, snd_nxt, rcv_nxt;//snd_una:记录发送缓冲区snd_buf中第一个未确认的包;snd_nxt:下一个待分配的包序号;rcv_nxt：待接收消息序号。为了保证包的顺序，接收方会维护一个接收窗口，接收窗口有一个起始序号rcv_nxt（待接收消息序号）以及尾序号 rcv_nxt + rcv_wnd（接收窗口大小）；
 	IUINT32 ts_recent, ts_lastack, ssthresh;//ssthresh：拥塞窗口阈值，以包为单位（TCP以字节为单位）；
 	IINT32 rx_rttval, rx_srtt, rx_rto, rx_minrto;//rx_rttval：RTT的变化量，代表连接的抖动情况； rx_srtt：smoothed round trip time，平滑后的RTT；rx_rto：由ACK接收延迟计算出来的重传超时时间；
 	IUINT32 snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe;//snd_wnd：发送窗口大小；rcv_wnd：接收窗口大小； rmt_wnd：远端接收窗口大小；cwnd：拥塞窗口大小；probe：探查变量，IKCP_ASK_TELL表示告知远端窗口大小。IKCP_ASK_SEND表示请求远端告知窗口大小；
