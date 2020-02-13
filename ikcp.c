@@ -545,9 +545,9 @@ static void ikcp_update_ack(ikcpcb *kcp, IINT32 rtt)
 		kcp->rx_srtt = rtt;
 		kcp->rx_rttval = rtt / 2;
 	}	else {
-		long delta = rtt - kcp->rx_srtt;
+		long delta = rtt - kcp->rx_srtt;//计算这次和之前的差值
 		if (delta < 0) delta = -delta;
-		kcp->rx_rttval = (3 * kcp->rx_rttval + delta) / 4;
+		kcp->rx_rttval = (3 * kcp->rx_rttval + delta) / 4;//权重计算
 		kcp->rx_srtt = (7 * kcp->rx_srtt + rtt) / 8;
 		if (kcp->rx_srtt < 1) kcp->rx_srtt = 1;
 	}

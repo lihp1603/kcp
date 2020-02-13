@@ -1,0 +1,73 @@
+
+	
+	
+	首先我们对几个东西需要弄清楚:
+	对于接收方，我们收到的数据，经过input函数解析的时候，先是放入rcv_buf中，进行排序，对于排好序的有序数据，
+	我们会从rcv_buf再移动到rcv_queue接收队列中，然后用户调用recv函数的时候，我们就直接从rcv_queue队列中取出来，
+	这样用户得到的数据就是有序的数据包了。
+	而对于kcp->rcv_nxt;这个是接收方用于标识我们接下来待接收的数据，也就是说rcv_nxt前面的数据，我们已经有序的全部收到了。
+	应答的时候，ack消息中，就会将这个rcv_nxt的值设置为ack中的una来告知发送方。
+	
+	
+	对于发送方，用户调用send函数的时候，我们会先将数据分包按序放入snd_queue中,然后在flush函数中，
+	在发送之前，我们会再从snd_queue中根据窗口大小，取出这次能发送的新数据包，重新打包，并按序存入到snd_buf中。
+	其中打包的时候，sn的序号是依次通过分包的时候，snd_nxt++来进行编号的，所以可以认为snd_nxt为我们打包的最右侧数据包序号。
+	同时打包的时候，还会将这次需要发送消息的una设置为rcv_nxt。
+	其次我们来看一下发送方在收到对方网络传送过来的ack应答以后的处理，先调用input函数，
+	然后根据ack消息中的una，我们先从snd_buf缓存数据中删除sn为una之前的所有数据包,因为una在ack中的值为对端kcp->rcv_nxt的值，
+	其次是更新发送端的kcp的kcp_snd_una的值，所以发送端的kcp->snd_una表示的是我们在snd_buf中缓存的最小或者说最左侧的数据包序号。
+	然后接着根据发生方发送过来ack中的sn序号，我们从snd_buf中，再删除掉这部分对端收到的数据包。
+	经过上述两个步骤以后，于是snd_buf中缓存的数据就是我们没有收到ack的数据包了，
+	这部分数据包，我们在下次调用flush的时候会根据是否超时，是否被ack跳包等情况来进行重传和发送。
+	
+	看下kcp的拥塞控制机制:
+	cwnd为发送端的拥塞控制窗口大小,ssthresh为拥塞窗口的阀值。
+	
+	如果网络情况比较好的话，我们就逐步加大拥塞窗口的大小，发送更多的数据。
+	//网络比较好的时候，调整拥塞窗口大小的算法
+	if (_itimediff(kcp->snd_una, una) > 0) {//如果我们发送数据缓存中最左侧的数据包序号>接收端确认的最左侧数据包序号
+		if (kcp->cwnd < kcp->rmt_wnd) {//拥塞窗口大小<对端窗口大小
+			IUINT32 mss = kcp->mss;
+			if (kcp->cwnd < kcp->ssthresh) {//拥塞窗口阈值，以包为单位
+				kcp->cwnd++;
+				kcp->incr += mss;
+			}	else {
+				if (kcp->incr < mss) kcp->incr = mss;
+				kcp->incr += (mss * mss) / kcp->incr + (mss / 16);
+				if ((kcp->cwnd + 1) * mss <= kcp->incr) {
+					kcp->cwnd++;
+				}
+			}
+			if (kcp->cwnd > kcp->rmt_wnd) {
+				kcp->cwnd = kcp->rmt_wnd;
+				kcp->incr = kcp->rmt_wnd * mss;
+			}
+		}
+	}
+
+	
+	如果因为ack跳过出现数据可能的丢包，我们将通过算法进行调整，将拥塞窗口的大小减少为发送出去数据量的一半，
+	即下次发送的时候，我们发送上次一半的数据量，来避免网络拥堵。
+	if (change) {//如果是因为ack被跳过一定次数认为的丢包的情况
+		IUINT32 inflight = kcp->snd_nxt - kcp->snd_una;//计算有多个消息数量在网络传输中
+		kcp->ssthresh = inflight / 2;//拥塞窗口大小阀值计算
+		if (kcp->ssthresh < IKCP_THRESH_MIN)
+			kcp->ssthresh = IKCP_THRESH_MIN;
+		kcp->cwnd = kcp->ssthresh + resent;
+		kcp->incr = kcp->cwnd * kcp->mss;
+	}
+	
+	如果出现超时丢包重传的情况，说明网络情况已经很糟糕的，因为ack啥的都可能丢失了，
+	所以这个时候，我们直接将拥塞窗口大小设置为最小，大量减少下次的数据网络传输。
+	//超时丢包的情况，说明网络情况更加糟糕，需要进一步对拥塞窗口进行计算
+	if (lost) {//数据发送超时，认为丢包的情况
+		kcp->ssthresh = cwnd / 2;
+		if (kcp->ssthresh < IKCP_THRESH_MIN)
+			kcp->ssthresh = IKCP_THRESH_MIN;
+		kcp->cwnd = 1;
+		kcp->incr = kcp->mss;
+	}
+
+	
+	
+	
